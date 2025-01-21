@@ -6,33 +6,33 @@ use winit::{
     window::{Window, WindowAttributes},
 };
 
-use wgpu::{
-    include_wgsl, Adapter, Device, DeviceDescriptor, Instance, InstanceDescriptor, Queue,
-    RenderPipeline, RenderPipelineDescriptor, Surface, SurfaceConfiguration,
-};
-
-use super::texture::Texture;
+use wgpu::{include_wgsl, util::DeviceExt};
 
 use std::sync::Arc;
 
-use crate::world::World;
+use crate::{
+    render::texture::Texture,
+    world::{camera::Camera, World},
+};
 
 pub struct GfxContext {
     pub window: Arc<Window>,
-    pub surface: Surface<'static>,
+    pub surface: wgpu::Surface<'static>,
 
-    pub config: SurfaceConfiguration,
+    pub config: wgpu::SurfaceConfiguration,
     pub size: winit::dpi::PhysicalSize<u32>,
 
-    depth_texture: super::texture::Texture,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
 
-    pub device: Device,
-    pub queue: Queue,
+    pub global_shader_bindings: GlobalShaderBindings,
+
+    depth_texture: super::texture::Texture,
 }
 
 impl GfxContext {
     pub async fn create(event_loop: &ActiveEventLoop) -> Result<GfxContext> {
-        let window = Arc::new(Self::create_window(&event_loop).context("Create window")?);
+        let window = Arc::new(Self::create_window(event_loop).context("Create window")?);
 
         let size = window.inner_size();
 
@@ -53,6 +53,8 @@ impl GfxContext {
         dbg!(&adapter.get_info());
 
         let (device, queue) = Self::create_device(&adapter).await?;
+
+        dbg!(device.limits());
 
         let surface_caps = surface.get_capabilities(&adapter);
 
@@ -80,39 +82,46 @@ impl GfxContext {
 
         surface.configure(&device, &config);
 
+        let global_shader_bindings = GlobalShaderBindings::init(&device);
         let depth_texture = Texture::create_depth_texture(&device, &config, "depth texture");
 
         Ok(Self {
             window,
             surface,
+
             config,
             size,
-            depth_texture,
+
             device,
             queue,
+
+            global_shader_bindings,
+
+            depth_texture,
         })
     }
 
     fn create_window(event_loop: &ActiveEventLoop) -> Result<Window> {
-        let window_attributes = WindowAttributes::default();
-            //.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+        let window_attributes =
+            WindowAttributes::default().with_inner_size(PhysicalSize::new(1280, 720));
+        //.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
 
-        Ok(event_loop
+        event_loop
             .create_window(window_attributes)
-            .context("Create WINIT window")?)
+            .context("Create WINIT window")
     }
 
-    fn create_instance() -> Instance {
-        wgpu::Instance::new(InstanceDescriptor {
+    fn create_instance() -> wgpu::Instance {
+        wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..Default::default()
         })
     }
 
-    async fn create_device(adapter: &Adapter) -> Result<(Device, Queue)> {
+    async fn create_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue)> {
         let (device, queue) = adapter
             .request_device(
-                &DeviceDescriptor {
+                &wgpu::DeviceDescriptor {
                     label: Some("device"),
                     ..Default::default()
                 },
@@ -129,12 +138,17 @@ impl GfxContext {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
-            self.depth_texture = Texture::create_depth_texture(&self.device, &self.config, "depth texture");
+            self.depth_texture =
+                Texture::create_depth_texture(&self.device, &self.config, "depth texture");
         }
     }
 
     pub fn render(&self, world: &mut World) -> Result<()> {
-        world.prepare_render(&self.device, &self.queue);
+        world
+            .camera
+            .write_view_matrix_buffer(&self.queue, &self.global_shader_bindings.view_matrix_buffer);
+
+        world.prepare_render(self);
 
         let output = self.surface.get_current_texture()?;
         let view = output
@@ -155,11 +169,16 @@ impl GfxContext {
         Ok(())
     }
 
-    fn render_pass(&self, view: &wgpu::TextureView, encoder: &mut wgpu::CommandEncoder, world: &World) {
+    fn render_pass(
+        &self,
+        view: &wgpu::TextureView,
+        encoder: &mut wgpu::CommandEncoder,
+        world: &World,
+    ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("render pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
+                view,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -183,6 +202,101 @@ impl GfxContext {
             occlusion_query_set: None,
         });
 
+        pass.set_bind_group(0, &self.global_shader_bindings.group, &[]);
+
         world.render(&mut pass);
+    }
+
+    pub fn update_projection_matrix_buffer(&self, camera: &Camera) {
+        let aspect = self.window_aspect_ratio();
+        camera.write_projection_matrix_buffer(
+            &self.queue,
+            &self.global_shader_bindings.proj_matrix_buffer,
+            aspect,
+        );
+    }
+
+    fn window_aspect_ratio(&self) -> f32 {
+        self.config.width as f32 / self.config.height as f32
+    }
+}
+
+pub struct GlobalShaderBindings {
+    pub layout: wgpu::BindGroupLayout,
+    pub group: wgpu::BindGroup,
+
+    pub view_matrix_buffer: wgpu::Buffer,
+    pub proj_matrix_buffer: wgpu::Buffer,
+}
+
+impl GlobalShaderBindings {
+    pub fn init(device: &wgpu::Device) -> Self {
+        let identity: &[u8] = bytemuck::cast_slice(glam::Mat4::IDENTITY.as_ref());
+
+        let view_matrix_buffer =
+            Self::create_uniform_buffer(device, identity, Some("view matrix buffer"));
+        let proj_matrix_buffer =
+            Self::create_uniform_buffer(device, identity, Some("projection matrix buffer"));
+
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("camera bind group layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("camera bind group"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: view_matrix_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: proj_matrix_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        Self {
+            layout,
+            group,
+
+            view_matrix_buffer,
+            proj_matrix_buffer,
+        }
+    }
+
+    fn create_uniform_buffer(
+        device: &wgpu::Device,
+        init_data: &[u8],
+        label: Option<&'static str>,
+    ) -> wgpu::Buffer {
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            contents: init_data,
+        })
     }
 }

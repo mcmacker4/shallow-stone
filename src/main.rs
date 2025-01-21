@@ -86,13 +86,10 @@ impl ApplicationHandler for App {
         device_id: winit::event::DeviceId,
         event: DeviceEvent,
     ) {
-        match event {
-            DeviceEvent::MouseMotion { delta } => {
-                if let Some(state) = &mut self.state {
-                    state.on_mouse_move(delta);
-                }
+        if let DeviceEvent::MouseMotion { delta } = event {
+            if let Some(state) = &mut self.state {
+                state.on_mouse_move(delta);
             }
-            _ => (),
         }
     }
 
@@ -115,7 +112,7 @@ impl InitializedApp {
     async fn create(evento_loop: &ActiveEventLoop) -> Result<Self> {
         let gfx = GfxContext::create(evento_loop).await?;
 
-        let world = World::new(&gfx.device, &gfx.config);
+        let world = World::new(&gfx);
 
         Ok(Self {
             gfx,
@@ -177,8 +174,7 @@ impl InitializedApp {
 
     fn on_resize(&mut self, size: PhysicalSize<u32>) {
         self.gfx.resize(size);
-        let aspect = size.width as f32 / size.height as f32;
-        self.world.update_camera_projection(&self.gfx.queue, aspect);
+        self.gfx.update_projection_matrix_buffer(&self.world.camera);
     }
 
     fn grab_mouse(&mut self) {
@@ -189,7 +185,7 @@ impl InitializedApp {
             false => winit::window::CursorGrabMode::None,
         };
 
-        if let Ok(_) = self.gfx.window.set_cursor_grab(next) {
+        if self.gfx.window.set_cursor_grab(next).is_ok() {
             self.gfx.window.set_cursor_visible(!grab);
             self.mouse_grabbed = grab;
         }

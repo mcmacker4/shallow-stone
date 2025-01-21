@@ -10,6 +10,12 @@ pub struct InputState {
     mouse_position: PhysicalPosition<f64>,
 }
 
+impl Default for InputState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InputState {
     pub fn new() -> Self {
         Self {
